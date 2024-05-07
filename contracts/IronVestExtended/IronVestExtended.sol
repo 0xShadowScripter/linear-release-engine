@@ -7,6 +7,7 @@ import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol"
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "./IronVestPreCheck.sol";
 
 /// @author The ferrum network.
 /// @title This is a vesting contract named as IronVest.
@@ -14,7 +15,7 @@ import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.
 /// @notice This contract contains the power of accesscontrol.
 /// There are two different vesting defined in the contract with different functionalities.
 /// Have fun reading it. Hopefully it's bug-free. God Bless.
-contract IronVest is
+contract IronVestExtended is
     Initializable,
     ReentrancyGuardUpgradeable,
     AccessControlUpgradeable
@@ -40,6 +41,8 @@ contract IronVest is
         uint256 remainingToBeClaimable; /// remaining claimable fully claimable once time ended.
         uint256 lastWithdrawal; /// block.timestamp used for internal claimable calculation
         uint256 releaseRatePerSec; /// calculated as vestingTime/(vestingTime-starttime)
+        bool deprecated; /// The allocated address is deprecated and new address allocated.
+        address updatedAddress; /// If (deprecated = true) otherwise it will denote address(0x00)
     }
 
     /// @notice This struct will save all the pool information about simple vesting i.e addCliffVesting().
@@ -66,6 +69,8 @@ contract IronVest is
         uint256 remainingToBeClaimableCliff; /// remaining claimable fully claimable once time ended.
         uint256 cliffReleaseRatePerSec; /// calculated as cliffAlloc/(cliffendtime -cliffPeriodendtime).
         uint256 cliffLastWithdrawal; /// block.timestamp used for internal claimable calculation.
+        bool deprecated; /// The allocated address is deprecated and new address allocated.
+        address updatedAddress; /// If (deprecated = true) otherwise it will denote address(0x00)
     }
 
     /// @notice Used to store information about the user of non cliff in cliff vesting.
@@ -77,17 +82,20 @@ contract IronVest is
         uint256 remainingToBeClaimableNonCliff; /// remaining claimable fully claimable once time ended.
         uint256 nonCliffReleaseRatePerSec; /// calculated as nonCliffAlloc/(cliffVestingEndTime-vestingEndTime).
         uint256 nonCliffLastWithdrawal; /// used for internal claimable calculation.
+        bool deprecated; /// The allocated address is deprecated and new address allocated.
+        address updatedAddress; /// If (deprecated = true) otherwise it will denote address(0x00)
     }
 
     /// @notice Vester role initialization.
     bytes32 public constant VESTER_ROLE = keccak256("VESTER_ROLE");
+    // @notice IronVest pre checks contract
+    IronVestPreCheck public VestingCheck;
     /// @notice Public variable to store contract name.
     string public vestingContractName;
     /// @notice Unique identity of contract.
     uint256 public vestingPoolSize;
     /// @notice Signer address. Transaction supposed to be sign be this address.
     address public signer;
-
     /// Cliff mapping with the check if the specific pool relate to the cliff vesting or not.
     mapping(uint256 => bool) public cliff;
     /// Double mapping to check user information by address and poolid for cliff vesting.
@@ -97,6 +105,8 @@ contract IronVest is
     /// Double mapping to check user information by address and poolid for cliff vesting.
     mapping(uint256 => mapping(address => UserNonCliffInfo))
         public userNonCliffInfo;
+    // Get updated address from outdated address
+    mapping(address => address) public deprecatedAddressOf;
     /// Hash Information to avoid the replay from same _messageHash
     mapping(bytes32 => bool) public usedHashes;
     /// Pool information against specific poolid for simple vesting.
@@ -128,7 +138,6 @@ contract IronVest is
         string poolName,
         uint256 vestingEndTime,
         uint256 cliffVestingEndTime,
-        uint256 nonCliffVestingPeriod,
         uint256 cliffPeriodEndTime,
         address tokenAddress,
         uint256 totalVestedTokens,
@@ -163,6 +172,15 @@ contract IronVest is
         uint256 remaining
     );
 
+    /// @dev This event will emit if there is a need to update allocation to new address.
+    /// @notice Deprecated, updated address and poolId indexed
+    event UpdateBeneficiaryWithdrawalAddress(
+        uint256 indexed poolId,
+        address indexed deprecatedAddress,
+        address indexed newAddress,
+        bool isCliff
+    );
+
     /// @notice Modifier to check if vester.
     modifier onlyVester() {
         require(
@@ -182,18 +200,20 @@ contract IronVest is
     }
 
     /// @dev deploy the contract by upgradeable proxy by any framewrok.
-    /// @param _vestingName : A name to our vesting contract.
     /// @param _signer : An address verification for facing the replay attack issues.
     /// @notice Contract is upgradeable need initialization and deployer is default admin.
-    function initialize(string memory _vestingName, address _signer)
-        external
-        initializer
-    {
+    function initialize(
+        string memory _vestingName,
+        address _signer,
+        address _default_Admin,
+        IronVestPreCheck _ironVestPreCheckAddress
+    ) external initializer {
         __ReentrancyGuard_init();
         __AccessControl_init();
         vestingContractName = _vestingName;
-        _setupRole(DEFAULT_ADMIN_ROLE, _msgSender());
-        _setupRole(VESTER_ROLE, _msgSender());
+        VestingCheck = _ironVestPreCheckAddress;
+        _setupRole(DEFAULT_ADMIN_ROLE, _default_Admin);
+        _setupRole(VESTER_ROLE, _default_Admin);
         signer = _signer;
     }
 
@@ -215,13 +235,10 @@ contract IronVest is
         bytes memory _signature,
         bytes memory _keyHash
     ) external onlyVester nonReentrant {
-        require(
-            _usersAddresses.length == _userAlloc.length,
-            "IIronVest Array : Length of _usersAddresses And _userAlloc Must Be Equal"
-        );
-        require(
-            _vestingEndTime > block.timestamp,
-            "IIronVest : Vesting End Time Should Be Greater Than Current Time"
+        VestingCheck.preAddVesting(
+            _vestingEndTime,
+            _usersAddresses,
+            _userAlloc
         );
         require(
             signatureVerification(
@@ -240,7 +257,9 @@ contract IronVest is
                 0,
                 _userAlloc[i],
                 block.timestamp,
-                _userAlloc[i] / (_vestingEndTime - block.timestamp)
+                _userAlloc[i] / (_vestingEndTime - block.timestamp),
+                false,
+                address(0x00)
             );
         }
         _poolInfo[vestingPoolSize] = PoolInfo(
@@ -257,6 +276,9 @@ contract IronVest is
             address(this),
             totalVesting
         );
+        usedHashes[
+            VestingCheck.messageHash(_poolName, _tokenAddress, _keyHash)
+        ] = true;
         _totalVestedTokens[_tokenAddress] += totalVesting;
         emit AddVesting(
             _msgSender(),
@@ -270,7 +292,6 @@ contract IronVest is
             _userAlloc
         );
         vestingPoolSize = vestingPoolSize + 1;
-        usedHashes[_messageHash(_poolName, _tokenAddress, _keyHash)] = true;
     }
 
     /// @dev User must have allocation in the pool.
@@ -279,19 +300,23 @@ contract IronVest is
     /// @notice Secured by nonReentrant
     function claim(uint256 _poolId) external nonReentrant {
         uint256 transferAble = claimable(_poolId, _msgSender());
+        UserInfo storage info = userInfo[_poolId][_msgSender()];
         require(transferAble > 0, "IIronVest : Invalid TransferAble");
         IERC20Upgradeable(_poolInfo[_poolId].tokenAddress).safeTransfer(
             _msgSender(),
             transferAble
         );
-        UserInfo storage info = userInfo[_poolId][_msgSender()];
         uint256 claimed = (info.claimedAmount + transferAble);
         uint256 remainingToBeClaimable = info.allocation - claimed;
         info.claimedAmount = claimed;
         info.remainingToBeClaimable = remainingToBeClaimable;
         info.lastWithdrawal = block.timestamp;
-
-        emit Claim(_poolId, transferAble, _msgSender(), remainingToBeClaimable);
+        emit Claim(
+            _poolId,
+            transferAble,
+            _msgSender(),
+            remainingToBeClaimable
+        );
     }
 
     /// @dev Only callable by vester.
@@ -302,7 +327,7 @@ contract IronVest is
     /// @param _tokenAddress : Token address related to the vested token.
     /// @param _cliffPercentage10000 : cliff percentage defines how may percentage should be allocated to cliff tokens.
     /// @param _usersAddresses : Users addresses whom the vester want to allocate tokens and it is an array.
-    /// @param _userAlloc : Users allocation of tokens with respect to address.
+    /// @param _usersAlloc : Users allocation of tokens with respect to address.
     /// @param _signature : Signature of the signed by signer.
     /// @param _keyHash : Specific keyhash value formed to stop replay.
     /// @notice Create a new vesting with cliff.
@@ -314,25 +339,17 @@ contract IronVest is
         address _tokenAddress,
         uint256 _cliffPercentage10000,
         address[] memory _usersAddresses,
-        uint256[] memory _userAlloc,
+        uint256[] memory _usersAlloc,
         bytes memory _signature,
         bytes memory _keyHash
     ) external onlyVester nonReentrant {
-        require(
-            _usersAddresses.length == _userAlloc.length,
-            "IIronVest Array : Length of _usersAddresses And _userAlloc Must Be Equal"
-        );
-        require(
-            _cliffVestingEndTime < _vestingEndTime,
-            "IIronVest : Cliff Vesting End Time Must Be Lesser Than Vesting Time"
-        );
-        require(
-            _cliffVestingEndTime > _cliffPeriodEndTime,
-            "IIronVest : Cliff Vesting Time Must Be Greater Than Cliff Period"
-        );
-        require(
-            _cliffPeriodEndTime > block.timestamp,
-            "IIronVest : Cliff Vesting Time Must Be Lesser Than Vesting Time"
+        VestingCheck.preAddCliffVesting(
+            _vestingEndTime,
+            _cliffVestingEndTime,
+            _cliffPeriodEndTime,
+            _cliffPercentage10000,
+            _usersAddresses,
+            _usersAlloc
         );
         require(
             signatureVerification(
@@ -343,36 +360,40 @@ contract IronVest is
             ) == signer,
             "Signer : Invalid signer"
         );
-        require(
-            _cliffPercentage10000 <= 5000,
-            "Percentage : Percentage Should Be less Than 50%"
-        );
+        usedHashes[
+            VestingCheck.messageHash(_poolName, _tokenAddress, _keyHash)
+        ] = true;
         uint256 totalVesting;
         for (uint256 i = 0; i < _usersAddresses.length; i++) {
-            uint256 cliffAlloc = (_userAlloc[i] * _cliffPercentage10000) /
+            uint256 cliffAlloc = (_usersAlloc[i] * _cliffPercentage10000) /
                 10000;
-            totalVesting += _userAlloc[i];
-            uint256 nonCliffRemainingTobeclaimable = _userAlloc[i] - cliffAlloc;
+            totalVesting += _usersAlloc[i];
+            uint256 nonCliffRemainingTobeclaimable = _usersAlloc[i] -
+                cliffAlloc;
             userCliffInfo[vestingPoolSize][_usersAddresses[i]] = UserCliffInfo(
-                _userAlloc[i],
+                _usersAlloc[i],
                 cliffAlloc,
                 0,
                 _cliffPeriodEndTime,
                 cliffAlloc,
                 (cliffAlloc) / (_cliffVestingEndTime - _cliffPeriodEndTime),
-                _cliffPeriodEndTime
+                _cliffPeriodEndTime,
+                false,
+                address(0x00)
             );
             userNonCliffInfo[vestingPoolSize][
                 _usersAddresses[i]
             ] = UserNonCliffInfo(
-                _userAlloc[i],
+                _usersAlloc[i],
                 nonCliffRemainingTobeclaimable,
                 0,
                 _cliffPeriodEndTime,
                 nonCliffRemainingTobeclaimable,
-                (_userAlloc[i] - (cliffAlloc)) /
+                (_usersAlloc[i] - (cliffAlloc)) /
                     (_vestingEndTime - _cliffPeriodEndTime),
-                _cliffPeriodEndTime
+                _cliffPeriodEndTime,
+                false,
+                address(0x00)
             );
         }
         uint256 nonCliffVestingPeriod = _vestingEndTime - _cliffPeriodEndTime;
@@ -387,7 +408,7 @@ contract IronVest is
             totalVesting,
             _cliffPercentage10000,
             _usersAddresses,
-            _userAlloc
+            _usersAlloc
         );
         IERC20Upgradeable(_tokenAddress).safeTransferFrom(
             _msgSender(),
@@ -402,15 +423,104 @@ contract IronVest is
             _poolName,
             _vestingEndTime,
             _cliffVestingEndTime,
-            nonCliffVestingPeriod,
             _cliffPeriodEndTime,
             _tokenAddress,
             totalVesting,
             _usersAddresses,
-            _userAlloc
+            _usersAlloc
         );
         vestingPoolSize = vestingPoolSize + 1;
-        usedHashes[_messageHash(_poolName, _tokenAddress, _keyHash)] = true;
+    }
+
+    /// @dev Only callable by owner.
+    /// @param _poolId : On which pool admin want to update user address.
+    /// @param _deprecatedAddress : Old address that need to be updated.
+    /// @param _updatedAddress : New address that gonna replace old address.
+    /// @notice This function is useful whenever a person lose their address which has pool allocation.
+    /// @notice If else block will specify if the pool ID is related to cliff vesting or simple vesting.
+    function updateBeneficiaryAddress(
+        uint256 _poolId,
+        address _deprecatedAddress,
+        address _updatedAddress
+    ) external virtual onlyOwner nonReentrant {
+        VestingCheck.preUpdateBeneficiaryAddress(
+            _poolId,
+            _deprecatedAddress,
+            _updatedAddress,
+            vestingPoolSize
+        );
+        bool isCliff = cliff[_poolId];
+        if (isCliff) {
+            CliffPoolInfo storage pool = _cliffPoolInfo[_poolId];
+            UserCliffInfo storage cliffInfo = userCliffInfo[_poolId][
+                _deprecatedAddress
+            ];
+            UserNonCliffInfo storage nonCliffInfo = userNonCliffInfo[_poolId][
+                _deprecatedAddress
+            ];
+            require(
+                nonCliffInfo.allocation > 0,
+                "Allocation : This address doesn't have allocation in this pool"
+            );
+            userNonCliffInfo[_poolId][_updatedAddress] = UserNonCliffInfo(
+                nonCliffInfo.allocation,
+                nonCliffInfo.nonCliffAlloc,
+                nonCliffInfo.claimedAmnt,
+                nonCliffInfo.tokensReleaseTime,
+                nonCliffInfo.remainingToBeClaimableNonCliff,
+                nonCliffInfo.nonCliffReleaseRatePerSec,
+                nonCliffInfo.nonCliffLastWithdrawal,
+                false,
+                address(0x00)
+            );
+            userCliffInfo[_poolId][_updatedAddress] = UserCliffInfo(
+                cliffInfo.allocation,
+                cliffInfo.cliffAlloc,
+                cliffInfo.claimedAmnt,
+                cliffInfo.tokensReleaseTime,
+                cliffInfo.remainingToBeClaimableCliff,
+                cliffInfo.cliffReleaseRatePerSec,
+                cliffInfo.cliffLastWithdrawal,
+                false,
+                address(0x00)
+            );
+            delete cliffInfo.allocation;
+            cliffInfo.updatedAddress = _updatedAddress;
+            cliffInfo.deprecated = true;
+            delete nonCliffInfo.allocation;
+            nonCliffInfo.updatedAddress = _updatedAddress;
+            nonCliffInfo.deprecated = true;
+            pool.usersAddresses.push(_updatedAddress);
+            pool.usersAlloc.push(cliffInfo.allocation);
+        } else {
+            PoolInfo storage pool = _poolInfo[_poolId];
+            UserInfo storage info = userInfo[_poolId][_deprecatedAddress];
+            require(
+                info.allocation > 0,
+                "Allocation : This address doesn't have allocation in this pool"
+            );
+            userInfo[_poolId][_updatedAddress] = UserInfo(
+                info.allocation,
+                info.claimedAmount,
+                info.remainingToBeClaimable,
+                info.lastWithdrawal,
+                info.releaseRatePerSec,
+                false,
+                address(0x00)
+            );
+            delete info.allocation;
+            info.updatedAddress = _updatedAddress;
+            info.deprecated = true;
+            pool.usersAddresses.push(_updatedAddress);
+            pool.usersAlloc.push(info.allocation);
+        }
+        deprecatedAddressOf[_updatedAddress] = _deprecatedAddress;
+        emit UpdateBeneficiaryWithdrawalAddress(
+            _poolId,
+            _deprecatedAddress,
+            _updatedAddress,
+            isCliff
+        );
     }
 
     /// @dev User must have allocation in the pool.
@@ -494,6 +604,13 @@ contract IronVest is
             "Invalid : Signer Address Is Invalid"
         );
         signer = _signer;
+    }
+
+    /// @dev Function is called by a default admin.
+    /// @param _vestingPreCheck : Reset ironvest pre check address.
+    function setPreCheck(IronVestPreCheck _vestingPreCheck) external onlyOwner {
+        require(address(_vestingPreCheck) !=address(0x00), "Invalid Address");
+        VestingCheck = _vestingPreCheck;
     }
 
     /// @dev As we are using poolId as unique ID which is supposed to return pool info i.e
@@ -583,6 +700,33 @@ contract IronVest is
         return (claimable);
     }
 
+    /// @dev This is check claimable for non cliff vesting.
+    /// @param _poolId : Pool Id from which pool user want to check.
+    /// @param _user : User address for which user want to check claimables.
+    /// @return returning the claimable amount of the user from non cliff vesting.
+    function nonCliffClaimable(uint256 _poolId, address _user)
+        public
+        view
+        returns (uint256)
+    {
+        uint256 nonCliffClaimable;
+        UserNonCliffInfo memory info = userNonCliffInfo[_poolId][_user];
+        require(
+            info.allocation > 0,
+            "Allocation : You Don't have allocation in this pool"
+        );
+
+        if (_cliffPoolInfo[_poolId].cliffPeriodEndTime <= block.timestamp) {
+            if (_cliffPoolInfo[_poolId].vestingEndTime >= block.timestamp) {
+                nonCliffClaimable =
+                    (block.timestamp - info.nonCliffLastWithdrawal) *
+                    info.nonCliffReleaseRatePerSec;
+            } else nonCliffClaimable = info.remainingToBeClaimableNonCliff;
+        }
+
+        return (nonCliffClaimable);
+    }
+
     /// @dev This is check claimable for cliff vesting.
     /// @param _poolId : Pool Id from which pool user want to check.
     /// @param _user : User address for which user want to check claimables.
@@ -612,33 +756,6 @@ contract IronVest is
         return (cliffClaimable);
     }
 
-    /// @dev This is check claimable for non cliff vesting.
-    /// @param _poolId : Pool Id from which pool user want to check.
-    /// @param _user : User address for which user want to check claimables.
-    /// @return returning the claimable amount of the user from non cliff vesting.
-    function nonCliffClaimable(uint256 _poolId, address _user)
-        public
-        view
-        returns (uint256)
-    {
-        uint256 nonCliffClaimable;
-        UserNonCliffInfo memory info = userNonCliffInfo[_poolId][_user];
-        require(
-            info.allocation > 0,
-            "Allocation : You Don't have allocation in this pool"
-        );
-
-        if (_cliffPoolInfo[_poolId].cliffPeriodEndTime <= block.timestamp) {
-            if (_cliffPoolInfo[_poolId].vestingEndTime >= block.timestamp) {
-                nonCliffClaimable =
-                    (block.timestamp - info.nonCliffLastWithdrawal) *
-                    info.nonCliffReleaseRatePerSec;
-            } else nonCliffClaimable = info.remainingToBeClaimableNonCliff;
-        }
-
-        return (nonCliffClaimable);
-    }
-
     /// @dev For getting signer address from salt and signature.
     /// @param _signature : signature provided signed by signer.
     /// @param _poolName : Pool Name to name a pool.
@@ -651,11 +768,17 @@ contract IronVest is
         address _tokenAddress,
         bytes memory _keyHash
     ) public view returns (address) {
-        bytes32 _salt = _messageHash(_poolName, _tokenAddress, _keyHash);
-        (bytes32 r, bytes32 s, uint8 v) = _splitSignature(_signature);
+        bytes32 _salt = VestingCheck.messageHash(
+            _poolName,
+            _tokenAddress,
+            _keyHash
+        );
+        (bytes32 r, bytes32 s, uint8 v) = VestingCheck.splitSignature(
+            _signature
+        );
         require(!usedHashes[_salt], "Message already used");
 
-        address _user = _verifyMessage(_salt, v, r, s);
+        address _user = VestingCheck.verifyMessage(_salt, v, r, s);
         return _user;
     }
     
@@ -669,79 +792,5 @@ contract IronVest is
         return
             IERC20Upgradeable(_tokenAddress).balanceOf(address(this)) -
             _totalVestedTokens[_tokenAddress];
-    }
-
-    /// @dev For splititng signature.
-    /// @param _sig : signature provided signed by signer
-    /// @return r : First 32 bytes stores the length of the signature.
-    /// @return s : add(sig, 32) = pointer of sig + 32
-    /// effectively, skips first 32 bytes of signature.
-    /// @return v : mload(p) loads next 32 bytes starting
-    /// at the memory address p into memory.
-    function _splitSignature(bytes memory _sig)
-        internal
-        pure
-        returns (
-            bytes32 r,
-            bytes32 s,
-            uint8 v
-        )
-    {
-        require(_sig.length == 65, "invalid signature length");
-
-        assembly {
-            /// First 32 bytes stores the length of the signature
-
-            /// add(_sig, 32) = pointer of _sig + 32
-            /// effectively, skips first 32 bytes of signature
-
-            /// mload(p) loads next 32 bytes starting at the memory address p into memory
-
-            /// first 32 bytes, after the length prefix
-            r := mload(add(_sig, 32))
-            /// second 32 bytes
-            s := mload(add(_sig, 64))
-            /// final byte (first byte of the next 32 bytes)
-            v := byte(0, mload(add(_sig, 96)))
-        }
-
-        /// implicitly return (r, s, v)
-    }
-
-    /// @dev Verify and recover signer from salt and signature.
-    /// @param _salt : A hash value which contains concatenated hash of different values.
-    /// @param _v : mload(p) loads next 32 bytes starting at the memory address p into memory.
-    /// @param _r : First 32 bytes stores the length of the signature.
-    /// @param _s : add(sig, 32) = pointer of sig + 32 effectively, skips first 32 bytes of signature.
-    /// @return signerAddress : Return the address of signer.
-    function _verifyMessage(
-        bytes32 _salt,
-        uint8 _v,
-        bytes32 _r,
-        bytes32 _s
-    ) internal pure returns (address signerAddress) {
-        bytes memory prefix = "\x19Ethereum Signed Message:\n32";
-        bytes32 prefixedHashMessage = keccak256(
-            abi.encodePacked(prefix, _salt)
-        );
-        address _signerAddress = ecrecover(prefixedHashMessage, _v, _r, _s);
-        return _signerAddress;
-    }
-
-    /// @dev create a message hash by concatincating the values.
-    /// @param _poolName : Pool name.
-    /// @param _tokenAddress : Vesting token address .
-    /// @param _keyHash : key hash value generated by our backend to stop replay attack.
-    /// also a chain Id so that a user can't replay the hash any other chain.
-    /// @return returning keccak hash of concate values.
-    function _messageHash(
-        string memory _poolName,
-        address _tokenAddress,
-        bytes memory _keyHash
-    ) internal view returns (bytes32) {
-        bytes32 hash = keccak256(
-            abi.encodePacked(_poolName, _tokenAddress, _keyHash, block.chainid)
-        );
-        return hash;
     }
 }
